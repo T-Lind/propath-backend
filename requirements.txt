@@ -2,3 +2,5 @@ psycopg2
 python-dotenv
 flask
 flask-cors
+flask-jwt-extended
+nsfw_detector
