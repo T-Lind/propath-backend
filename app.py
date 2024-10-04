@@ -142,11 +142,12 @@ def search_skills():
     cur = conn.cursor()
 
     try:
-        # Search query for skills by name or description
+        # Fetch skills along with the username and background
         cur.execute('''
-            SELECT id, name, description, category
-            FROM skills
-            WHERE name ILIKE %s OR description ILIKE %s
+            SELECT s.id, s.name, s.description, s.category, s.background, u.username
+            FROM skills s
+            JOIN users u ON s.user_id = u.id
+            WHERE s.name ILIKE %s OR s.description ILIKE %s
             LIMIT %s
         ''', (f'%{query}%', f'%{query}%', limit))
 
@@ -157,21 +158,21 @@ def search_skills():
             'id': row[0],
             'name': row[1],
             'description': row[2],
-            'category': row[3]
+            'category': row[3],
+            'background': row[4],
+            'username': row[5]  # Return the username of the person who submitted it
         } for row in skills]
 
         # Fetch resources for each skill
         skill_ids = [row[0] for row in skills]
-        print("Skill IDs: ", skill_ids)
         resources = {}
         if skill_ids:
             cur.execute('''
-                SELECT skill_id, id, title, description, type, url, is_paid, status, created_at
+                SELECT skill_id, id, title, description, type, url, is_paid
                 FROM resources
                 WHERE skill_id = ANY(%s) AND status = %s
             ''', (skill_ids, 'approved'))
             resources_data = cur.fetchall()
-            print("Resources: ", resources_data)
 
             # Organize resources by skill_id
             for resource in resources_data:
@@ -190,10 +191,7 @@ def search_skills():
         # Add resources to each skill
         for skill in res:
             skill_id = skill['id']
-            if skill_id in resources:
-                skill['resources'] = resources[skill_id]
-            else:
-                skill['resources'] = []
+            skill['resources'] = resources.get(skill_id, [])
 
         return jsonify({'skills': res})
     finally:
@@ -201,7 +199,7 @@ def search_skills():
         return_db_connection(conn)
 
 
-# Add Search Endpoint for Career Advice
+
 @app.route('/api/career-advice/search', methods=['GET'])
 def search_career_advice():
     query = request.args.get('q', '')
@@ -209,26 +207,32 @@ def search_career_advice():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Search query for career advice by title, industry, or career stage
-    cur.execute('''
-        SELECT id, industry, career_stage, title, content
-        FROM career_advice
-        WHERE (title ILIKE %s OR industry ILIKE %s OR career_stage ILIKE %s)
-        AND status = %s
-        LIMIT %s
-    ''', (f'%{query}%', f'%{query}%', f'%{query}%', 'published', limit))
+    try:
+        # Fetch career advice along with the username and background
+        cur.execute('''
+            SELECT ca.id, ca.industry, ca.career_stage, ca.title, ca.content, ca.background, u.username
+            FROM career_advice ca
+            JOIN users u ON ca.user_id = u.id
+            WHERE (ca.title ILIKE %s OR ca.industry ILIKE %s OR ca.career_stage ILIKE %s)
+            AND ca.status = %s
+            LIMIT %s
+        ''', (f'%{query}%', f'%{query}%', f'%{query}%', 'published', limit))
 
-    career_advice = cur.fetchall()
-    cur.close()
-    return_db_connection(conn)
+        career_advice = cur.fetchall()
 
-    return jsonify([{
-        'id': row[0],
-        'industry': row[1],
-        'career_stage': row[2],
-        'title': row[3],
-        'content': row[4]
-    } for row in career_advice])
+        return jsonify([{
+            'id': row[0],
+            'industry': row[1],
+            'career_stage': row[2],
+            'title': row[3],
+            'content': row[4],
+            'background': row[5],  # Return background field
+            'username': row[6]  # Return the username of the person who submitted it
+        } for row in career_advice])
+    finally:
+        cur.close()
+        return_db_connection(conn)
+
 
 
 @app.route('/api/propose-new-skill', methods=['POST'])
@@ -237,26 +241,22 @@ def propose_new_skill():
     data = request.json
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
+    user_id = get_jwt_identity()  # Capture user ID from JWT
 
     try:
-        # Log the received data for debugging
-        print("Received data: ", data)
-
         # Validate required fields
-        required_fields = ['name', 'description', 'category', 'difficulty_level']
+        required_fields = ['name', 'description', 'category', 'difficulty_level', 'background']
         for field in required_fields:
             if field not in data or not data[field]:
                 return jsonify({"error": f"'{field}' is required"}), 400
 
-        if any(is_nsfw(data[field]) for field in required_fields if field in data):
-            return jsonify({"error": "Proposed content contains inappropriate material"}), 400
-
+        # Insert new skill proposal with user_id and background
         cur.execute("""
             INSERT INTO proposed_skills
-            (name, description, category, difficulty_level, proposer_id, status)
-            VALUES (%s, %s, %s, %s, %s, 'pending')
+            (name, description, category, difficulty_level, proposer_id, background, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending')
             RETURNING id
-        """, (data['name'], data['description'], data['category'], data.get('difficulty_level'), get_jwt_identity()))
+        """, (data['name'], data['description'], data['category'], data['difficulty_level'], user_id, data['background']))
         proposal_id = cur.fetchone()['id']
 
         # Handle resources
@@ -272,11 +272,12 @@ def propose_new_skill():
         return jsonify({"message": "New skill proposed successfully", "id": proposal_id}), 201
     except Exception as e:
         conn.rollback()
-        print("Error: ", e)
         return jsonify({"error": str(e)}), 400
     finally:
         cur.close()
         return_db_connection(conn)
+
+
 
 @app.route('/api/propose-new-career-advice', methods=['POST'])
 @jwt_required()
@@ -284,17 +285,19 @@ def propose_new_career_advice():
     data = request.json
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
+    user_id = get_jwt_identity()  # Capture user ID from JWT
 
     try:
         if any(is_nsfw(data[field]) for field in ['title', 'industry', 'career_stage', 'content'] if field in data):
             return jsonify({"error": "Proposed content contains inappropriate material"}), 400
 
+        # Insert new career advice proposal with user_id and background
         cur.execute("""
             INSERT INTO proposed_career_advice
-            (title, industry, career_stage, content, proposer_id, status)
-            VALUES (%s, %s, %s, %s, %s, 'pending')
+            (title, industry, career_stage, content, proposer_id, background, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending')
             RETURNING id
-        """, (data['title'], data['industry'], data['career_stage'], data['content'], get_jwt_identity()))
+        """, (data['title'], data['industry'], data['career_stage'], data['content'], user_id, data.get('background')))
         proposal_id = cur.fetchone()['id']
 
         conn.commit()
@@ -305,6 +308,7 @@ def propose_new_career_advice():
     finally:
         cur.close()
         return_db_connection(conn)
+
 
 @app.route('/api/proposed-skills', methods=['GET'])
 @jwt_required()
@@ -335,7 +339,7 @@ def get_proposed_career_advice():
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
-        cur.execute("SELECT * FROM proposed_career_advice")
+        cur.execute("SELECT * FROM proposed_career_advice WHERE status NOT IN ('approved', 'rejected')")
         proposed_career_advice = cur.fetchall()
         return jsonify(proposed_career_advice)
     except Exception as e:
@@ -344,9 +348,9 @@ def get_proposed_career_advice():
         cur.close()
         return_db_connection(conn)
 
-@app.route('/api/approve-change/<int:skill_id>', methods=['POST'])
+@app.route('/api/approve-skills-change/<int:skill_id>', methods=['POST'])
 @jwt_required()
-def approve_change(skill_id):
+def approve_skills_change(skill_id):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -397,9 +401,9 @@ def approve_change(skill_id):
         return_db_connection(conn)
 
 
-@app.route('/api/reject-change/<int:skill_id>', methods=['POST'])
+@app.route('/api/reject-skills-change/<int:skill_id>', methods=['POST'])
 @jwt_required()
-def reject_change(skill_id):
+def reject_skills_change(skill_id):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -418,6 +422,63 @@ def reject_change(skill_id):
         cur.close()
         return_db_connection(conn)
 
+@app.route('/api/approve-career-advice-change/<int:advice_id>', methods=['POST'])
+@jwt_required()
+def approve_career_advice_change(advice_id):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        # Fetch the proposed career advice
+        cur.execute("SELECT * FROM proposed_career_advice WHERE id = %s", (advice_id,))
+        proposed_advice = cur.fetchone()
+
+        if not proposed_advice:
+            return jsonify({"error": "Proposed career advice not found"}), 404
+
+        # Insert the proposed career advice into the career_advice table
+        cur.execute("""
+            INSERT INTO career_advice (title, industry, career_stage, content, status, user_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (proposed_advice['title'], proposed_advice['industry'], proposed_advice['career_stage'], proposed_advice['content'], 'published', proposed_advice['proposer_id']))
+        new_advice_id = cur.fetchone()['id']
+
+        # Update the status of the proposed career advice to 'approved'
+        cur.execute("UPDATE proposed_career_advice SET status = %s WHERE id = %s", ('approved', advice_id))
+
+        # Commit the transaction
+        conn.commit()
+
+        return jsonify({"message": "Career advice approved successfully", "id": new_advice_id}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 400
+    finally:
+        cur.close()
+        return_db_connection(conn)
+
+
+@app.route('/api/reject-career-advice-change/<int:advice_id>', methods=['POST'])
+@jwt_required()
+def reject_career_advice_change(advice_id):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        # Update the status of the proposed career advice to 'rejected'
+        cur.execute("UPDATE proposed_career_advice SET status = %s WHERE id = %s", ('rejected', advice_id))
+
+        # Commit the transaction
+        conn.commit()
+
+        return jsonify({"message": "Career advice rejected successfully"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 400
+    finally:
+        cur.close()
+        return_db_connection(conn)
 
 if __name__ == '__main__':
     app.run(debug=True)
