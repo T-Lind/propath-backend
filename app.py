@@ -268,6 +268,14 @@ def propose_new_skill():
                     VALUES (%s, %s, %s, %s, %s, %s)
                 """, (proposal_id, resource['title'], resource.get('description', ''), resource['type'], resource['url'], resource['is_paid']))
 
+        # Handle tags
+        if 'tags' in data:
+            for tag in data['tags']:
+                cur.execute("""
+                    INSERT INTO proposed_skill_tags (proposed_skill_id, tag)
+                    VALUES (%s, %s)
+                """, (proposal_id, tag))
+
         conn.commit()
         return jsonify({"message": "New skill proposed successfully", "id": proposal_id}), 201
     except Exception as e:
@@ -300,6 +308,14 @@ def propose_new_career_advice():
         """, (data['title'], data['industry'], data['career_stage'], data['content'], user_id, data.get('background')))
         proposal_id = cur.fetchone()['id']
 
+        # Handle tags
+        if 'tags' in data:
+            for tag in data['tags']:
+                cur.execute("""
+                    INSERT INTO proposed_career_advice_tags (proposed_career_advice_id, tag)
+                    VALUES (%s, %s)
+                """, (proposal_id, tag))
+
         conn.commit()
         return jsonify({"message": "New career advice proposed successfully", "id": proposal_id}), 201
     except Exception as e:
@@ -318,9 +334,12 @@ def get_proposed_skills():
 
     try:
         cur.execute("""
-            SELECT ps.*, array_agg(json_build_object('id', psr.id, 'title', psr.title, 'description', psr.description, 'type', psr.type, 'url', psr.url, 'is_paid', psr.is_paid)) as resources
+            SELECT ps.*, 
+                   array_agg(DISTINCT json_build_object('id', psr.id, 'title', psr.title, 'description', psr.description, 'type', psr.type, 'url', psr.url, 'is_paid', psr.is_paid)) as resources,
+                   array_agg(DISTINCT pst.tag) as tags
             FROM proposed_skills ps
             LEFT JOIN proposed_skill_resources psr ON ps.id = psr.proposed_skill_id
+            LEFT JOIN proposed_skill_tags pst ON ps.id = pst.proposed_skill_id
             WHERE ps.status NOT IN ('approved', 'rejected')
             GROUP BY ps.id
         """)
@@ -339,7 +358,14 @@ def get_proposed_career_advice():
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
-        cur.execute("SELECT * FROM proposed_career_advice WHERE status NOT IN ('approved', 'rejected')")
+        cur.execute("""
+            SELECT pca.*,
+                   array_agg(DISTINCT pcat.tag) as tags
+            FROM proposed_career_advice pca
+            LEFT JOIN proposed_career_advice_tags pcat ON pca.id = pcat.proposed_career_advice_id
+            WHERE pca.status NOT IN ('approved', 'rejected')
+            GROUP BY pca.id
+        """)
         proposed_career_advice = cur.fetchall()
         return jsonify(proposed_career_advice)
     except Exception as e:
@@ -443,6 +469,17 @@ def approve_career_advice_change(advice_id):
             RETURNING id
         """, (proposed_advice['title'], proposed_advice['industry'], proposed_advice['career_stage'], proposed_advice['content'], 'published', proposed_advice['proposer_id']))
         new_advice_id = cur.fetchone()['id']
+
+        # Fetch the proposed tags
+        cur.execute("SELECT tag FROM proposed_career_advice_tags WHERE proposed_career_advice_id = %s", (advice_id,))
+        proposed_tags = cur.fetchall()
+
+        # Insert the proposed tags into the career_advice_tags table
+        for tag in proposed_tags:
+            cur.execute("""
+                INSERT INTO career_advice_tags (career_advice_id, tag)
+                VALUES (%s, %s)
+            """, (new_advice_id, tag['tag']))
 
         # Update the status of the proposed career advice to 'approved'
         cur.execute("UPDATE proposed_career_advice SET status = %s WHERE id = %s", ('approved', advice_id))
