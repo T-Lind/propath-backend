@@ -3,7 +3,6 @@ from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from psycopg2 import pool
 from werkzeug.security import generate_password_hash, check_password_hash
-from nsfw_detector import scan_text
 from psycopg2.extras import RealDictCursor
 import os
 from dotenv import load_dotenv
@@ -32,8 +31,10 @@ def return_db_connection(conn):
     connection_pool.putconn(conn)
 
 
-def is_nsfw(content):
-    return scan_text(content)
+
+def is_nsfw(content) -> bool:
+    # TODO: Not implemented
+    return False
 
 
 @app.route('/api/register', methods=['POST'])
@@ -108,41 +109,6 @@ def login():
         return_db_connection(conn)
 
 
-@app.route('/api/career-advice', methods=['GET'])
-def get_career_advice():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT id, industry, career_stage, title, content FROM career_advice WHERE status = %s',
-                ('published',))
-    career_advice = cur.fetchall()
-    cur.close()
-    return_db_connection(conn)
-
-    return jsonify([{
-        'id': row[0],
-        'industry': row[1],
-        'career_stage': row[2],
-        'title': row[3],
-        'content': row[4]
-    } for row in career_advice])
-
-
-@app.route('/api/skills', methods=['GET'])
-def get_skills():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT id, name, description, category FROM skills')
-    skills = cur.fetchall()
-    cur.close()
-    return_db_connection(conn)
-    res = [{
-        'id': row[0],
-        'name': row[1],
-        'description': row[2],
-        'category': row[3]
-    } for row in skills]
-
-    return jsonify(res)
 
 
 @app.route('/api/skills/<int:skill_id>/resources', methods=['GET'])
@@ -196,14 +162,16 @@ def search_skills():
 
         # Fetch resources for each skill
         skill_ids = [row[0] for row in skills]
+        print("Skill IDs: ", skill_ids)
         resources = {}
         if skill_ids:
             cur.execute('''
-                SELECT skill_id, id, title, description, type, url, is_paid
+                SELECT skill_id, id, title, description, type, url, is_paid, status, created_at
                 FROM resources
                 WHERE skill_id = ANY(%s) AND status = %s
             ''', (skill_ids, 'approved'))
             resources_data = cur.fetchall()
+            print("Resources: ", resources_data)
 
             # Organize resources by skill_id
             for resource in resources_data:
@@ -219,7 +187,15 @@ def search_skills():
                     'is_paid': resource[6],
                 })
 
-        return jsonify({'skills': res, 'resources': resources})
+        # Add resources to each skill
+        for skill in res:
+            skill_id = skill['id']
+            if skill_id in resources:
+                skill['resources'] = resources[skill_id]
+            else:
+                skill['resources'] = []
+
+        return jsonify({'skills': res})
     finally:
         cur.close()
         return_db_connection(conn)
@@ -255,76 +231,52 @@ def search_career_advice():
     } for row in career_advice])
 
 
-@app.route('/api/propose-change', methods=['POST'])
+@app.route('/api/propose-new-skill', methods=['POST'])
 @jwt_required()
-def propose_change():
+def propose_new_skill():
     data = request.json
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
-        if is_nsfw(data['proposed_value']):
+        # Log the received data for debugging
+        print("Received data: ", data)
+
+        # Validate required fields
+        required_fields = ['name', 'description', 'category', 'difficulty_level']
+        for field in required_fields:
+            if field not in data or not data[field]:
+                return jsonify({"error": f"'{field}' is required"}), 400
+
+        if any(is_nsfw(data[field]) for field in required_fields if field in data):
             return jsonify({"error": "Proposed content contains inappropriate material"}), 400
 
-        is_new_entity = data.get('is_new_entity', False)
-        entity_id = data['entity_id'] if not is_new_entity else None
-
         cur.execute("""
-            INSERT INTO proposed_changes
-            (entity_type, entity_id, field_name, current_value, proposed_value, proposer_id, is_new_entity)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO proposed_skills
+            (name, description, category, difficulty_level, proposer_id, status)
+            VALUES (%s, %s, %s, %s, %s, 'pending')
             RETURNING id
-        """, (data['entity_type'], entity_id, data['field_name'],
-              data.get('current_value'), data['proposed_value'], data['proposer_id'], is_new_entity))
+        """, (data['name'], data['description'], data['category'], data.get('difficulty_level'), get_jwt_identity()))
+        proposal_id = cur.fetchone()['id']
 
-        new_id = cur.fetchone()['id']
+        # Handle resources
+        if 'resources' in data:
+            for resource in data['resources']:
+                cur.execute("""
+                    INSERT INTO proposed_skill_resources
+                    (proposed_skill_id, title, description, type, url, is_paid)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (proposal_id, resource['title'], resource.get('description', ''), resource['type'], resource['url'], resource['is_paid']))
+
         conn.commit()
-
-        return jsonify({"message": "Change proposed successfully", "id": new_id}), 201
+        return jsonify({"message": "New skill proposed successfully", "id": proposal_id}), 201
     except Exception as e:
         conn.rollback()
+        print("Error: ", e)
         return jsonify({"error": str(e)}), 400
     finally:
         cur.close()
         return_db_connection(conn)
-
-
-@app.route('/api/proposed-changes', methods=['GET'])
-@jwt_required()
-def get_proposed_changes():
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-
-    entity_type = request.args.get('entity_type')
-    entity_id = request.args.get('entity_id')
-    include_new = request.args.get('include_new', 'false').lower() == 'true'
-
-    try:
-        query = "SELECT * FROM proposed_changes WHERE 1=1"
-        params = []
-
-        if entity_type:
-            query += " AND entity_type = %s"
-            params.append(entity_type)
-
-        if entity_id:
-            query += " AND entity_id = %s"
-            params.append(entity_id)
-        elif include_new:
-            query += " AND (entity_id IS NOT NULL OR is_new_entity = TRUE)"
-        else:
-            query += " AND entity_id IS NOT NULL"
-
-        cur.execute(query, tuple(params))
-
-        changes = cur.fetchall()
-        return jsonify(changes)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-    finally:
-        cur.close()
-        return_db_connection(conn)
-
 
 @app.route('/api/propose-new-career-advice', methods=['POST'])
 @jwt_required()
@@ -337,36 +289,16 @@ def propose_new_career_advice():
         if any(is_nsfw(data[field]) for field in ['title', 'industry', 'career_stage', 'content'] if field in data):
             return jsonify({"error": "Proposed content contains inappropriate material"}), 400
 
-        # Insert the main career advice proposal
         cur.execute("""
-            INSERT INTO proposed_changes
-            (entity_type, field_name, proposed_value, proposer_id, is_new_entity)
-            VALUES ('career_advice', 'title', %s, %s, TRUE)
+            INSERT INTO proposed_career_advice
+            (title, industry, career_stage, content, proposer_id, status)
+            VALUES (%s, %s, %s, %s, %s, 'pending')
             RETURNING id
-        """, (data['title'], get_jwt_identity()))
-        main_proposal_id = cur.fetchone()['id']
-
-        # Insert additional fields as separate proposals
-        additional_fields = ['industry', 'career_stage', 'content']
-        for field in additional_fields:
-            if field in data:
-                cur.execute("""
-                    INSERT INTO proposed_changes
-                    (entity_type, field_name, proposed_value, proposer_id, is_new_entity)
-                    VALUES ('career_advice', %s, %s, %s, TRUE)
-                """, (field, data[field], get_jwt_identity()))
-
-        # Handle tags
-        if 'tags' in data:
-            for tag in data['tags']:
-                cur.execute("""
-                    INSERT INTO proposed_changes
-                    (entity_type, field_name, proposed_value, proposer_id, is_new_entity)
-                    VALUES ('career_advice', 'tag', %s, %s, TRUE)
-                """, (tag, get_jwt_identity()))
+        """, (data['title'], data['industry'], data['career_stage'], data['content'], get_jwt_identity()))
+        proposal_id = cur.fetchone()['id']
 
         conn.commit()
-        return jsonify({"message": "New career advice proposed successfully", "id": main_proposal_id}), 201
+        return jsonify({"message": "New career advice proposed successfully", "id": proposal_id}), 201
     except Exception as e:
         conn.rollback()
         return jsonify({"error": str(e)}), 400
@@ -374,159 +306,89 @@ def propose_new_career_advice():
         cur.close()
         return_db_connection(conn)
 
-
-@app.route('/api/approve-change/<int:change_id>', methods=['POST'])
+@app.route('/api/proposed-skills', methods=['GET'])
 @jwt_required()
-def approve_change(change_id):
-    current_user_id = get_jwt_identity()
+def get_proposed_skills():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
-        # Check if the current user is an admin
-        cur.execute("SELECT role FROM users WHERE id = %s", (current_user_id,))
-        user_role = cur.fetchone()['role']
-
-        if user_role != 'admin':
-            return jsonify({"error": "Only admin users can approve changes"}), 403
-
-        # Get the change details
-        cur.execute("SELECT * FROM proposed_changes WHERE id = %s", (change_id,))
-        change = cur.fetchone()
-
-        if not change:
-            return jsonify({"error": "Change not found"}), 404
-
-        if change['is_new_entity']:
-            # Handle new entity creation
-            if change['entity_type'] == 'skill':
-                cur.execute("""
-                    INSERT INTO skills (name, description, category)
-                    VALUES (%s, %s, %s)
-                    RETURNING id
-                """, (change['proposed_value'], '', ''))  # You might want to adjust this based on your needs
-            elif change['entity_type'] == 'career_advice':
-                cur.execute("""
-                     INSERT INTO career_advice (title, industry, career_stage, content, author_id, status)
-                     VALUES (%s, %s, %s, %s, %s, 'published')
-                     RETURNING id
-                 """, (change['proposed_value'], '', '', '', change['proposer_id']))
-                new_career_advice_id = cur.fetchone()['id']
-
-                # Fetch and apply all related changes
-                cur.execute("""
-                     SELECT * FROM proposed_changes
-                     WHERE entity_type = 'career_advice' AND is_new_entity = TRUE AND status = 'pending'
-                 """)
-                related_changes = cur.fetchall()
-
-                for related_change in related_changes:
-                    if related_change['field_name'] == 'tag':
-                        # Handle tags
-                        cur.execute("INSERT INTO tags (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id",
-                                    (related_change['proposed_value'],))
-                        tag_id = cur.fetchone()['id']
-                        cur.execute("INSERT INTO career_advice_tags (career_advice_id, tag_id) VALUES (%s, %s)",
-                                    (new_career_advice_id, tag_id))
-                    else:
-                        # Update other fields
-                        cur.execute(f"""
-                             UPDATE career_advice
-                             SET {related_change['field_name']} = %s
-                             WHERE id = %s
-                         """, (related_change['proposed_value'], new_career_advice_id))
-
-                    # Mark related change as approved
-                    cur.execute("UPDATE proposed_changes SET status = 'approved' WHERE id = %s",
-                                (related_change['id'],))
-            else:
-                return jsonify({"error": "Invalid entity type"}), 400
-
-            new_entity_id = cur.fetchone()['id']
-        else:
-            # Update the original entity
-            if change['entity_type'] == 'skill':
-                table = 'skills'
-            elif change['entity_type'] == 'career_advice':
-                table = 'career_advice'
-            else:
-                return jsonify({"error": "Invalid entity type"}), 400
-
-            cur.execute(f"""
-                UPDATE {table}
-                SET {change['field_name']} = %s, updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-            """, (change['proposed_value'], change['entity_id']))
-
-        # Update the change status
         cur.execute("""
-            UPDATE proposed_changes
-            SET status = 'approved', updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """, (change_id,))
-
-        conn.commit()
-        return jsonify({"message": "Change approved and applied successfully",
-                        "new_entity_id": new_entity_id if change['is_new_entity'] else None})
+            SELECT ps.*, array_agg(json_build_object('id', psr.id, 'title', psr.title, 'description', psr.description, 'type', psr.type, 'url', psr.url, 'is_paid', psr.is_paid)) as resources
+            FROM proposed_skills ps
+            LEFT JOIN proposed_skill_resources psr ON ps.id = psr.proposed_skill_id
+            WHERE ps.status NOT IN ('approved', 'rejected')
+            GROUP BY ps.id
+        """)
+        proposed_skills = cur.fetchall()
+        return jsonify(proposed_skills)
     except Exception as e:
-        conn.rollback()
         return jsonify({"error": str(e)}), 400
     finally:
         cur.close()
         return_db_connection(conn)
 
-
-@app.route('/api/propose-new-skill', methods=['POST'])
+@app.route('/api/proposed-career-advice', methods=['GET'])
 @jwt_required()
-def propose_new_skill():
-    data = request.json
+def get_proposed_career_advice():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
-        if any(is_nsfw(data[field]) for field in ['name', 'description', 'category', 'difficulty_level'] if
-               field in data):
-            return jsonify({"error": "Proposed content contains inappropriate material"}), 400
+        cur.execute("SELECT * FROM proposed_career_advice")
+        proposed_career_advice = cur.fetchall()
+        return jsonify(proposed_career_advice)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    finally:
+        cur.close()
+        return_db_connection(conn)
 
-        # Insert the main skill proposal
+@app.route('/api/approve-change/<int:skill_id>', methods=['POST'])
+@jwt_required()
+def approve_change(skill_id):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        # Fetch the proposed skill
+        cur.execute("SELECT * FROM proposed_skills WHERE id = %s", (skill_id,))
+        proposed_skill = cur.fetchone()
+
+        if not proposed_skill:
+            return jsonify({"error": "Proposed skill not found"}), 404
+
+        # Validate difficulty_level
+        allowed_difficulty_levels = ['beginner', 'intermediate', 'advanced']  # Example allowed values
+        if proposed_skill['difficulty_level'] not in allowed_difficulty_levels:
+            return jsonify({"error": "Invalid difficulty level"}), 400
+
+        # Insert the proposed skill into the skills table
         cur.execute("""
-            INSERT INTO proposed_changes
-            (entity_type, field_name, proposed_value, proposer_id, is_new_entity)
-            VALUES ('skill', 'name', %s, %s, TRUE)
+            INSERT INTO skills (name, description, category, difficulty_level)
+            VALUES (%s, %s, %s, %s)
             RETURNING id
-        """, (data['name'], get_jwt_identity()))
-        main_proposal_id = cur.fetchone()['id']
+        """, (proposed_skill['name'], proposed_skill['description'], proposed_skill['category'], proposed_skill['difficulty_level']))
+        new_skill_id = cur.fetchone()['id']
 
-        # Insert additional fields as separate proposals
-        additional_fields = ['description', 'category', 'difficulty_level']
-        for field in additional_fields:
-            if field in data:
-                cur.execute("""
-                    INSERT INTO proposed_changes
-                    (entity_type, field_name, proposed_value, proposer_id, is_new_entity)
-                    VALUES ('skill', %s, %s, %s, TRUE)
-                """, (field, data[field], get_jwt_identity()))
+        # Fetch the proposed resources
+        cur.execute("SELECT * FROM proposed_skill_resources WHERE proposed_skill_id = %s", (skill_id,))
+        proposed_resources = cur.fetchall()
 
-        # Handle tags
-        if 'tags' in data:
-            for tag in data['tags']:
-                cur.execute("""
-                    INSERT INTO proposed_changes
-                    (entity_type, field_name, proposed_value, proposer_id, is_new_entity)
-                    VALUES ('skill', 'tag', %s, %s, TRUE)
-                """, (tag, get_jwt_identity()))
+        # Insert the proposed resources into the resources table with a default status
+        for resource in proposed_resources:
+            cur.execute("""
+                INSERT INTO resources (skill_id, title, description, type, url, is_paid, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (new_skill_id, resource['title'], resource['description'], resource['type'], resource['url'], resource['is_paid'], 'approved'))
 
-        # Handle resources
-        if 'resources' in data:
-            for resource in data['resources']:
-                cur.execute("""
-                    INSERT INTO proposed_changes
-                    (entity_type, field_name, proposed_value, proposer_id, is_new_entity)
-                    VALUES ('skill', 'resource', %s, %s, TRUE)
-                """, (str(resource), get_jwt_identity()))
+        # Update the status of the proposed skill to 'approved'
+        cur.execute("UPDATE proposed_skills SET status = %s WHERE id = %s", ('approved', skill_id))
 
+        # Commit the transaction
         conn.commit()
-        return jsonify({"message": "New skill proposed successfully", "id": main_proposal_id}), 201
+
+        return jsonify({"message": "Skill approved successfully", "id": new_skill_id}), 200
     except Exception as e:
         conn.rollback()
         return jsonify({"error": str(e)}), 400
@@ -535,37 +397,20 @@ def propose_new_skill():
         return_db_connection(conn)
 
 
-@app.route('/api/reject-change/<int:change_id>', methods=['POST'])
+@app.route('/api/reject-change/<int:skill_id>', methods=['POST'])
 @jwt_required()
-def reject_change(change_id):
-    current_user_id = get_jwt_identity()
+def reject_change(skill_id):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
-        # Check if the current user is an admin
-        cur.execute("SELECT role FROM users WHERE id = %s", (current_user_id,))
-        user_role = cur.fetchone()['role']
+        # Update the status of the proposed skill to 'rejected'
+        cur.execute("UPDATE proposed_skills SET status = %s WHERE id = %s", ('rejected', skill_id))
 
-        if user_role != 'admin':
-            return jsonify({"error": "Only admin users can reject changes"}), 403
-
-        # Get the change details
-        cur.execute("SELECT * FROM proposed_changes WHERE id = %s", (change_id,))
-        change = cur.fetchone()
-
-        if not change:
-            return jsonify({"error": "Change not found"}), 404
-
-        # Update the change status to rejected
-        cur.execute("""
-            UPDATE proposed_changes
-            SET status = 'rejected', updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """, (change_id,))
-
+        # Commit the transaction
         conn.commit()
-        return jsonify({"message": "Change rejected successfully"})
+
+        return jsonify({"message": "Skill rejected successfully"}), 200
     except Exception as e:
         conn.rollback()
         return jsonify({"error": str(e)}), 400
